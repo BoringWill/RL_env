@@ -1,86 +1,105 @@
 import torch
+import torch.nn as nn
 import numpy as np
 import pygame
 import sys
-from slime_env import SlimeSelfPlayEnv
-from train_gpu import Agent  # 确保你的训练脚本名为 train_gpu.py
+from collections import deque
+from slime_env import SlimeSelfPlayEnv, FrameStack
+
+
+# 确保与 train_gpu.py 一致 (256 维)
+class Agent(nn.Module):
+    def __init__(self):
+        super(Agent, self).__init__()
+        self.critic = nn.Sequential(
+            nn.Linear(48, 256), nn.ReLU(),
+            nn.Linear(256, 128), nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+        self.actor = nn.Sequential(
+            nn.Linear(48, 256), nn.ReLU(),
+            nn.Linear(256, 128), nn.ReLU(),
+            nn.Linear(128, 4)
+        )
 
 
 def enjoy_game(human_mode=False):
-    # 1. 设备配置
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"正在使用设备: {device}")
 
-    # 2. 环境初始化
-    # 必须设置 render_mode="human" 才能看到窗口
-    env = SlimeSelfPlayEnv(render_mode="human")
+    # 1. 初始化环境和包装器
+    raw_env = SlimeSelfPlayEnv(render_mode="human")
+    env = FrameStack(raw_env, n_frames=4)
 
-    # 【重要修复】: 先 reset 初始化内部对象(p1, p2, ball)，再 render 初始化窗口
-    obs_p1, _ = env.reset()
-    obs_p2 = env._get_obs(2)
-    env.render()
-
-    # 3. 网络初始化与模型加载
+    # 2. 加载模型
     agent = Agent().to(device)
     try:
-        # 加载权重文件
         state_dict = torch.load("slime_ppo_gpu.pth", map_location=device)
         agent.load_state_dict(state_dict)
-        agent.eval()  # 开启评估模式
+        agent.eval()
         print(">>> 模型加载成功，开始对战！")
-    except FileNotFoundError:
-        print("错误：找不到 'slime_ppo_gpu.pth' 文件，请确认训练已完成。")
+    except Exception as e:
+        print(f"加载模型失败: {e}")
         return
 
-    clock = pygame.time.Clock()
-    run = True
+    # 3. 初始重置与首帧强制渲染 (这一步确保窗口弹出)
+    obs_p1, _ = env.reset()
+    raw_env.render()
 
+    p2_frames = deque(maxlen=4)
+    init_p2_raw = raw_env._get_obs(2)
+    for _ in range(4): p2_frames.append(init_p2_raw)
+    obs_p2 = np.concatenate(list(p2_frames), axis=0)
+
+    run = True
     while run:
-        # A. 捕获 Pygame 事件（处理关闭窗口和按键）
+        # A. 必须在循环最开始处理事件
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 run = False
 
         # B. 决策逻辑
         if human_mode:
-            # --- 人类玩家控制 P1 (左侧红色) ---
             keys = pygame.key.get_pressed()
             action_p1 = 0
             if keys[pygame.K_a]:
-                action_p1 = 1  # 左
+                action_p1 = 1
             elif keys[pygame.K_d]:
-                action_p1 = 2  # 右
-            if keys[pygame.K_w]: action_p1 = 3  # 跳
+                action_p1 = 2
+            if keys[pygame.K_w]: action_p1 = 3
         else:
-            # --- AI 控制 P1 ---
             with torch.no_grad():
-                t_obs_p1 = torch.FloatTensor(obs_p1).unsqueeze(0).to(device)
-                logits_p1 = agent.actor(t_obs_p1)
-                action_p1 = torch.argmax(logits_p1, dim=1).item()
+                input_p1 = torch.FloatTensor(obs_p1).unsqueeze(0).to(device)
+                action_p1 = torch.argmax(agent.actor(input_p1), dim=1).item()
 
-        # --- AI 始终控制 P2 (右侧蓝色) ---
+        # P2 决策 (AI)
         with torch.no_grad():
-            t_obs_p2 = torch.FloatTensor(obs_p2).unsqueeze(0).to(device)
-            logits_p2 = agent.actor(t_obs_p2)
-            action_p2 = torch.argmax(logits_p2, dim=1).item()
+            input_p2 = torch.FloatTensor(obs_p2).unsqueeze(0).to(device)
+            action_p2 = torch.argmax(agent.actor(input_p2), dim=1).item()
 
-        # C. 环境步进
-        # step 会根据 render_mode 自动调用绘制逻辑
-        obs_p1, obs_p2, reward, done, _ = env.step(action_p1, action_p2)
+        # C. 执行动作
+        obs_p1, reward, term, trunc, info = env.step((action_p1, action_p2))
 
-        # D. 游戏重置
-        if done:
-            # print(f"本局结束，奖励结果: {reward}")
+        # D. 渲染画面
+        raw_env.render()
+
+        # E. 更新 P2 观测数据
+        n_obs_p2_raw = info["p2_raw_obs"]
+        p2_frames.append(n_obs_p2_raw)
+        obs_p2 = np.concatenate(list(p2_frames), axis=0)
+
+        # F. 游戏结束重置
+        if term or trunc:
             obs_p1, _ = env.reset()
-            obs_p2 = env._get_obs(2)
+            raw_env.render()  # 重置后立即画一帧
+            init_p2_raw = raw_env._get_obs(2)
+            p2_frames.clear()
+            for _ in range(4): p2_frames.append(init_p2_raw)
+            obs_p2 = np.concatenate(list(p2_frames), axis=0)
 
-        # E. 控制播放速度 (60 FPS)
-        clock.tick(60)
-
-    env.close()
     pygame.quit()
 
 
 if __name__ == "__main__":
-    # 如果想自己打 AI，把这里改为 True
+    # human_mode=True 时你可以用 A,D,W 控制左边的史莱姆
     enjoy_game(human_mode=False)
