@@ -77,8 +77,6 @@ class SlimeSelfPlayEnv(gym.Env):
         terminated = False
         truncated = False
 
-        # --- 提速逻辑已删除，球速保持恒定 ---
-
         # 执行动作
         for p, a in [(self.p1, action_p1), (self.p2, action_p2)]:
             p.vx = 0
@@ -125,18 +123,32 @@ class SlimeSelfPlayEnv(gym.Env):
                     "p2_raw_obs": self._get_obs(2),
                     "p1_score": self.p1_score,
                     "p2_score": self.p2_score,
-                    "episode_steps": self.global_step_in_episode # 方便训练脚本记录步数
+                    "episode_steps": self.global_step_in_episode
                 })
 
     def _custom_net_collision(self):
         b = self.ball
         nl, nr = NET_X - NET_WIDTH / 2, NET_X + NET_WIDTH / 2
-        if b.y + b.radius >= NET_Y and b.y < NET_Y and nl < b.x < nr:
-            b.vy = -abs(b.vy) * 0.8
-            b.y = NET_Y - b.radius
-        elif nl - b.radius < b.x < nr + b.radius and b.y > NET_Y:
-            b.vx *= -1.0
-            b.x = nl - b.radius if b.x < NET_X else nr + b.radius
+
+        # 1. 球网顶部碰撞（y轴向下为正，NET_Y 是网顶的 y 坐标）
+        # 判定条件：球的底部超过网顶，且上一时刻球在网顶上方，且球在网的宽度范围内
+        if b.y + b.radius >= NET_Y and b.y - b.vy < NET_Y:
+            if nl < b.x < nr:
+                b.vy = -abs(b.vy) * 0.8
+                b.y = NET_Y - b.radius  # 强制回弹到网顶上方
+                return
+
+        # 2. 球网侧面碰撞
+        # 判定条件：球的 y 坐标在球网的高度区间内（NET_Y 到 GROUND_Y 之间）
+        if b.y >= NET_Y:
+            # 从左侧撞网
+            if nl - b.radius < b.x < NET_X and b.vx > 0:
+                b.vx = -abs(b.vx)
+                b.x = nl - b.radius
+            # 从右侧撞网
+            elif NET_X < b.x < nr + b.radius and b.vx < 0:
+                b.vx = abs(b.vx)
+                b.x = nr + b.radius
 
     def render(self):
         if self.render_mode != "human": return

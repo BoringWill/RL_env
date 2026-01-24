@@ -1,15 +1,19 @@
 import torch
 import torch.nn as nn
 import numpy as np
-import pygame
+import gymnasium as gym
 import os
 from collections import deque
 from slime_env import SlimeSelfPlayEnv, FrameStack
 
-# --- 配置与路径 ---
-MODEL_P1_PATH = "slime_ppo_vs_fixed.pth"   # slime_ppo_vs_fixed.pth  ||  模型集/slime_ppo_gpu_v4.pth
-MODEL_P2_PATH = "模型集/slime_ppo_gpu_v4.pth"
+# --- 配置 ---
+NEW_MODEL_PATH = "模型集_opponent/train_20260124-152719/evolution_v10.pth"
+HISTORY_FOLDER = "想要对抗的模型集"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 测试参数
+NUM_ENVS = 8
+GAMES_PER_OPPONENT = 20
 
 
 # --- 模型结构 ---
@@ -27,80 +31,125 @@ class Agent(nn.Module):
             nn.Linear(128, 4)
         )
 
-    def get_action(self, obs, device):
+    def get_actions(self, obs_batch, device):
         with torch.no_grad():
-            t_obs = torch.FloatTensor(obs).unsqueeze(0).to(device)
+            t_obs = torch.FloatTensor(obs_batch).to(device)
             logits = self.actor(t_obs)
-            return torch.argmax(logits, dim=1).item()
+            return torch.argmax(logits, dim=1).cpu().numpy()
 
 
-def enjoy():
-    # 1. 初始化环境 (必须先定义好，稍后 reset 触发 pygame 初始化)
-    raw_env = SlimeSelfPlayEnv(render_mode="human")
-    env = FrameStack(raw_env, n_frames=4)
+def make_env():
+    return lambda: FrameStack(SlimeSelfPlayEnv(render_mode=None), n_frames=4)
 
-    # 2. 加载模型
-    p1_agent = Agent().to(DEVICE)
-    p2_agent = Agent().to(DEVICE)
 
-    try:
-        if os.path.exists(MODEL_P1_PATH):
-            p1_agent.load_state_dict(torch.load(MODEL_P1_PATH, map_location=DEVICE, weights_only=False))
-            print(f">>> P1 加载成功")
-        if os.path.exists(MODEL_P2_PATH):
-            p2_agent.load_state_dict(torch.load(MODEL_P2_PATH, map_location=DEVICE, weights_only=False))
-            print(f">>> P2 加载成功")
-    except Exception as e:
-        print(f"模型加载失败: {e}")
+def run_vector_battle(envs, agent_new, agent_hist, num_total_games):
+    new_model_wins = 0
+    games_finished = 0
+
+    obs_p1, infos = envs.reset()
+    p2_deques = [deque(maxlen=4) for _ in range(NUM_ENVS)]
+    for i in range(NUM_ENVS):
+        init_p2 = infos["p2_raw_obs"][i] if "p2_raw_obs" in infos else np.zeros(12)
+        for _ in range(4): p2_deques[i].append(init_p2)
+    obs_p2 = np.array([np.concatenate(list(d), axis=0) for d in p2_deques])
+
+    # --- 核心修改：初始化随机分配角色 ---
+    # side_swapped[i] 为 True 代表新模型在 P2 位置
+    side_swapped = np.random.rand(NUM_ENVS) > 0.5
+
+    while games_finished < num_total_games:
+        t_obs_agent_new = np.zeros((NUM_ENVS, 48), dtype=np.float32)
+        t_obs_agent_hist = np.zeros((NUM_ENVS, 48), dtype=np.float32)
+
+        for i in range(NUM_ENVS):
+            if not side_swapped[i]:
+                t_obs_agent_new[i] = obs_p1[i]
+                t_obs_agent_hist[i] = obs_p2[i]
+            else:
+                t_obs_agent_new[i] = obs_p2[i]
+                t_obs_agent_hist[i] = obs_p1[i]
+
+        actions_new = agent_new.get_actions(t_obs_agent_new, DEVICE)
+        actions_hist = agent_hist.get_actions(t_obs_agent_hist, DEVICE)
+
+        env_actions = np.zeros((NUM_ENVS, 2), dtype=np.int32)
+        for i in range(NUM_ENVS):
+            if not side_swapped[i]:
+                env_actions[i] = [actions_new[i], actions_hist[i]]
+            else:
+                env_actions[i] = [actions_hist[i], actions_new[i]]
+
+        obs_p1, rewards, terms, truncs, infos = envs.step(env_actions)
+
+        for i in range(NUM_ENVS):
+            if terms[i] or truncs[i]:
+                games_finished += 1
+
+                # 统计胜负
+                p1_won = infos["p1_score"][i] > infos["p2_score"][i]
+                p2_won = infos["p2_score"][i] > infos["p1_score"][i]
+
+                if not side_swapped[i]:
+                    if p1_won: new_model_wins += 1
+                else:
+                    if p2_won: new_model_wins += 1
+
+                # --- 核心修改：一局结束后重新随机分配角色 ---
+                side_swapped[i] = np.random.rand() > 0.5
+
+                p2_deques[i].clear()
+                for _ in range(4): p2_deques[i].append(infos["p2_raw_obs"][i])
+                if games_finished >= num_total_games: break
+            else:
+                p2_deques[i].append(infos["p2_raw_obs"][i])
+
+        obs_p2 = np.array([np.concatenate(list(d), axis=0) for d in p2_deques])
+
+    return new_model_wins
+
+
+def main():
+    print(f"正在启动 {NUM_ENVS} 个并行环境...")
+    envs = gym.vector.AsyncVectorEnv([make_env() for _ in range(NUM_ENVS)])
+
+    agent_new = Agent().to(DEVICE)
+    if not os.path.exists(NEW_MODEL_PATH):
+        print(f"找不到最新模型: {NEW_MODEL_PATH}")
         return
+    agent_new.load_state_dict(torch.load(NEW_MODEL_PATH, map_location=DEVICE))
+    agent_new.eval()
 
-    p1_agent.eval()
-    p2_agent.eval()
+    history_files = [f for f in os.listdir(HISTORY_FOLDER) if f.endswith('.pth')]
+    history_files.sort()
 
-    # --- 关键修复点：先 reset 确保 pygame 的视频系统被环境初始化 ---
-    obs_p1, _ = env.reset()
-    raw_env.render()  # 强制初始渲染
+    print("=" * 60)
+    print(f"随机角色对抗测试 | 并行数: {NUM_ENVS} | 目标总局数: {GAMES_PER_OPPONENT}")
+    print("=" * 60)
 
-    run = True
-    while run:
-        # P2 帧堆叠手动初始化
-        p2_frames = deque(maxlen=4)
-        init_p2_raw = raw_env._get_obs(2)
-        for _ in range(4): p2_frames.append(init_p2_raw)
-        obs_p2 = np.concatenate(list(p2_frames), axis=0)
+    results = []
+    for hist_file in history_files:
+        hist_path = os.path.join(HISTORY_FOLDER, hist_file)
+        agent_hist = Agent().to(DEVICE)
+        try:
+            agent_hist.load_state_dict(torch.load(hist_path, map_location=DEVICE))
+            agent_hist.eval()
+        except:
+            continue
 
-        game_over = False
-        while not game_over:
-            # A. 事件处理放在决策前，且必须在 pygame 初始化后调用
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    run = False
-                    game_over = True
+        print(f"正在对阵: {hist_file.ljust(25)}", end=" | ", flush=True)
+        wins = run_vector_battle(envs, agent_new, agent_hist, GAMES_PER_OPPONENT)
+        win_rate = (wins / GAMES_PER_OPPONENT) * 100
+        results.append((hist_file, win_rate))
+        print(f"模型总胜率: {win_rate:>6.2f}%")
 
-            # B. 决策
-            action_p1 = p1_agent.get_action(obs_p1, DEVICE)
-            action_p2 = p2_agent.get_action(obs_p2, DEVICE)
-
-            # C. 执行动作 (这里的 term 只有达到 win_score 10分时才为 True)
-            obs_p1, reward, term, trunc, info = env.step((action_p1, action_p2))
-
-            # D. 更新 P2 观测数据
-            p2_frames.append(info["p2_raw_obs"])
-            obs_p2 = np.concatenate(list(p2_frames), axis=0)
-
-            # E. 渲染
-            raw_env.render()
-
-            # F. 判断比赛是否真的结束 (10分制)
-            if term or trunc:
-                print(f"--- 比赛结束 | P1: {info['p1_score']} VS P2: {info['p2_score']} ---")
-                pygame.time.wait(2000)
-                game_over = True
-                # 这里不直接 break，外层循环会再次 env.reset() 开始新的一局
-                obs_p1, _ = env.reset()
-
-    pygame.quit()
+    print("\n" + "=" * 60)
+    print("历史版本挑战总结 (随机位置):")
+    for name, rate in results:
+        status = "✅ 强于该版本" if rate > 50 else "❌ 弱于该版本"
+        print(f"- {name.ljust(30)}: {rate:>6.2f}% {status}")
+    print("=" * 60)
+    envs.close()
 
 
 if __name__ == "__main__":
-    enjoy()
+    main()
