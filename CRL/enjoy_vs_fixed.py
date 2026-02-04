@@ -7,27 +7,27 @@ from collections import deque
 from slime_env import SlimeSelfPlayEnv, FrameStack
 
 # --- 配置 ---
-NEW_MODEL_PATH = "C:/Users/asus/Desktop/CRL_GPU/模型集_opponent/train_20260125-013011/slime_ppo_vs_fixed.pth"
-HISTORY_FOLDER = "模型集_历代版本最强"
+NEW_MODEL_PATH = "最强模型集/1.pth"
+HISTORY_FOLDER = "最强模型集"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 测试参数
 NUM_ENVS = 32
-GAMES_PER_OPPONENT = 20  # 建议稍微多打几局，结果更准
+GAMES_PER_OPPONENT = 5  # 建议稍微多打几局，结果更准
 
 
 # --- 模型结构 ---
 class Agent(nn.Module):
     def __init__(self):
         super(Agent, self).__init__()
-        # 保持结构完整以兼容各种模型
+        # 维度更新：13 (特征数) * 4 (堆叠帧) = 52
         self.critic = nn.Sequential(
-            nn.Linear(48, 256), nn.ReLU(),
+            nn.Linear(52, 256), nn.ReLU(),
             nn.Linear(256, 128), nn.ReLU(),
             nn.Linear(128, 1)
         )
         self.actor = nn.Sequential(
-            nn.Linear(48, 256), nn.ReLU(),
+            nn.Linear(52, 256), nn.ReLU(),
             nn.Linear(256, 128), nn.ReLU(),
             nn.Linear(128, 4)
         )
@@ -36,7 +36,10 @@ class Agent(nn.Module):
         with torch.no_grad():
             t_obs = torch.as_tensor(obs_batch, dtype=torch.float32, device=device)
             logits = self.actor(t_obs)
-            return torch.argmax(logits, dim=1).cpu().numpy()
+            # --- 修改部分：改用 Categorical 采样 ---
+            probs = torch.distributions.Categorical(logits=logits)
+            actions = probs.sample()
+            return actions.cpu().numpy()
 
 
 def make_env():
@@ -51,10 +54,10 @@ def run_vector_battle(envs, agent_new, agent_hist, num_total_games):
     obs_p1, infos = envs.reset()
     p2_deques = [deque(maxlen=4) for _ in range(NUM_ENVS)]
 
-    # 初始帧同步
+    # --- 关键修改：初始帧同步，由 12 改为 13 ---
     p2_raw_initial = infos.get("p2_raw_obs")
     for i in range(NUM_ENVS):
-        init_p2 = p2_raw_initial[i] if p2_raw_initial is not None else np.zeros(12)
+        init_p2 = p2_raw_initial[i] if p2_raw_initial is not None else np.zeros(13)
         for _ in range(4): p2_deques[i].append(init_p2)
 
     side_swapped = np.random.rand(NUM_ENVS) > 0.5
@@ -93,7 +96,8 @@ def run_vector_battle(envs, agent_new, agent_hist, num_total_games):
                 # 重置该环境的 P2 队列
                 side_swapped[i] = np.random.rand() > 0.5
                 p2_deques[i].clear()
-                res_p2 = p2_raw_batch[i] if p2_raw_batch is not None else np.zeros(12)
+                # --- 关键修改：重置时维度由 12 改为 13 ---
+                res_p2 = p2_raw_batch[i] if p2_raw_batch is not None else np.zeros(13)
                 for _ in range(4): p2_deques[i].append(res_p2)
 
                 if games_finished >= num_total_games: break

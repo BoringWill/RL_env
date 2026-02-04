@@ -10,16 +10,16 @@ from slime_env import SlimeSelfPlayEnv, FrameStack
 
 # --- 配置 ---
 CONFIG = {
-    "model_dir": "模型集_历代版本最强",
-    "games_per_match": 5,  # 每对选手打20局以获得更稳定的胜率
+    "model_dir": "最强模型集", #C:/Users/asus/Desktop/CRL_GPU/模型集_selfplay_gpu/run_20260127-224621
+    "games_per_match": 10,  # 每对选手打20局以获得更稳定的胜率
     "k_factor": 32,  # ELO K因子
-    "max_workers": 8,  # 建议设为你的核心数
+    "max_workers": 10,  # 建议设为你的核心数
     "temperature": 0.8  # 采样温度，0.8 兼顾了实力和随机变招
 }
 
 
 class Agent(nn.Module):
-    def __init__(self, input_dim=48):
+    def __init__(self, input_dim=52):
         super().__init__()
         self.actor = nn.Sequential(
             nn.Linear(input_dim, 256), nn.ReLU(),
@@ -28,16 +28,13 @@ class Agent(nn.Module):
         )
 
     def get_action_sample(self, obs, temperature=0.8):
-        """采样决策：通过 Softmax 概率分布选择动作"""
         with torch.no_grad():
+            # 确保输入张量的维度正确
             t_obs = torch.as_tensor(obs, dtype=torch.float32)
             logits = self.actor(t_obs)
-            # 应用温度系数
             probs = torch.softmax(logits / temperature, dim=-1)
-            # 建立分类分布并采样
             m = Categorical(probs)
             return m.sample().item()
-
 
 def load_weights(model, path):
     """修复后的加载函数：正确处理字典和纯权重"""

@@ -9,9 +9,9 @@ from slime_env import SlimeSelfPlayEnv, FrameStack
 # --- 配置 ---
 CONFIG = {
     # 模型 A（主模型 / P1 默认模型）
-    "model_path_a": "模型集_历代版本最强/slime_ppo_vs_fixed.pth",
+    "model_path_a": "最强模型集/evolution_v6.pth",
     # 模型 B（PK 模式下的对手模型）
-    "model_path_b": "模型集_历代版本最强/slime_ppo_vs_fixed.pth",
+    "model_path_b": "最强模型集/1.pth",
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 }
 
@@ -20,14 +20,14 @@ CONFIG = {
 class Agent(nn.Module):
     def __init__(self):
         super(Agent, self).__init__()
-        # 即使测试不用 critic，也保留结构以兼容权重加载
+        # 13 * 4 帧 = 52
         self.critic = nn.Sequential(
-            nn.Linear(48, 256), nn.ReLU(),
+            nn.Linear(52, 256), nn.ReLU(),
             nn.Linear(256, 128), nn.ReLU(),
             nn.Linear(128, 1)
         )
         self.actor = nn.Sequential(
-            nn.Linear(48, 256), nn.ReLU(),
+            nn.Linear(52, 256), nn.ReLU(),
             nn.Linear(256, 128), nn.ReLU(),
             nn.Linear(128, 4)
         )
@@ -38,8 +38,13 @@ class Agent(nn.Module):
             # 确保输入形状是 [batch_size, 48]
             if t_obs.dim() == 1:
                 t_obs = t_obs.unsqueeze(0)
+
             logits = self.actor(t_obs)
-            return torch.argmax(logits, dim=1).cpu().numpy()
+
+            # --- 修改部分：由 argmax 改为采样 ---
+            probs = torch.distributions.Categorical(logits=logits)
+            action = probs.sample()
+            return action.cpu().numpy()
 
 
 # --- 兼容性权重加载函数 ---

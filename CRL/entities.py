@@ -21,12 +21,12 @@ class Entity:
             self.vy = 0
 
     def draw_slime(self, screen):
+        # 视觉上依然保持半圆绘制
         pygame.draw.circle(screen, self.color, (int(self.x), int(self.y)), self.radius)
         pygame.draw.rect(screen, COLOR_BG, (self.x - self.radius, self.y, self.radius * 2, self.radius))
 
 
 class SlimeBall(Entity):
-    # --- 修改点 1: 初始化倍率 ---
     def __init__(self, x, y, radius, color):
         super().__init__(x, y, radius, color)
         self.speed_multiplier = 1.0
@@ -48,30 +48,33 @@ class SlimeBall(Entity):
         dy = self.y - slime.y
         dist = math.sqrt(dx ** 2 + dy ** 2)
 
-        if dist < (self.radius + slime.radius) and self.y < slime.y:
+        # 修改核心：判定范围改为整个圆，不再限制 self.y < slime.y
+        if dist < (self.radius + slime.radius):
+            # 计算碰撞法线角度
             angle = math.atan2(dy, dx)
 
-            # --- 修改点 2: 基础速度乘以倍率 ---
-            base_speed = 4 * self.speed_multiplier
-            # 垂直向上的冲力也应该随倍率提升，否则球会感觉“飘”不起来
-            upward_force = -7 * self.speed_multiplier
+            # 统一的反弹逻辑：基于碰撞点角度
+            # 如果球在玩家下方(dy > 0)，sin(angle)为正，vy自然向下(扣球)
+            # 如果球在玩家上方(dy < 0)，sin(angle)为负，vy自然向上(垫球)
+            speed = 15.0 * self.speed_multiplier
 
-            self.vx = math.cos(angle) * base_speed + slime.vx * 2.0
-            self.vy = math.sin(angle) * base_speed + upward_force + slime.vy * 2.0
+            # 玩家速度对球的贡献
+            self.vx = math.cos(angle) * speed + (slime.vx * 0.5)
+            self.vy = math.sin(angle) * speed + (slime.vy * 0.5)
 
+            # 速度上限限制
             current_speed = math.sqrt(self.vx ** 2 + self.vy ** 2)
-
-            # --- 修改点 3: 允许的最大速度上限也必须随倍率提升 ---
             dynamic_max_speed = BALL_MAX_SPEED * self.speed_multiplier
             if current_speed > dynamic_max_speed:
                 scale = dynamic_max_speed / current_speed
                 self.vx *= scale
                 self.vy *= scale
 
+            # --- 防止穿透：硬位移修正 ---
             overlap = (self.radius + slime.radius) - dist
             self.x += math.cos(angle) * overlap
             self.y += math.sin(angle) * overlap
-            return True  # 击球成功
+            return True
         return False
 
     def check_net_collision(self):
